@@ -56,13 +56,21 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
   # It is recommended that you use this optimizer for fine tuning, since this
   # is how the model was trained (note that the Adam m/v variables are NOT
   # loaded from init_checkpoint.)
-  optimizer = AdamWeightDecayOptimizer(
-      learning_rate=learning_rate,
-      weight_decay_rate=0.01,
-      beta_1=0.9,
-      beta_2=0.999,
-      epsilon=1e-6,
-      exclude_from_weight_decay=["LayerNorm", "layer_norm", "bias"])
+  if use_tpu:
+        optimizer = AdamWeightDecayOptimizer(
+            learning_rate=learning_rate,
+            weight_decay_rate=0.01,
+            beta_1=0.9,
+            beta_2=0.999,
+            epsilon=1e-6,
+            exclude_from_weight_decay=["LayerNorm", "layer_norm", "bias"])
+  else:
+         optimizer = tf.train.AdamOptimizer(
+         learning_rate=learning_rate,
+         beta1=0.9,
+         beta2=0.999,
+         epsilon=1e-6
+         )
 
   if use_tpu:
     optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)

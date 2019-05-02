@@ -105,6 +105,8 @@ flags.DEFINE_integer(
     "num_tpu_cores", 8,
     "Only used if `use_tpu` is True. Total number of TPU cores to use.")
 
+flags.DEFINE_integer("num_gpus", 4, "Total number of GPUs to use.")
+flags.DEFINE_bool("multi_worker", False, "Multi-worker training.")
 
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps, use_tpu,
@@ -177,11 +179,19 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
       train_op = optimization.create_optimizer(
           total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
 
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-          mode=mode,
-          loss=total_loss,
-          train_op=train_op,
-          scaffold_fn=scaffold_fn)
+      if FLAGS.use_tpu:
+          output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+              mode=mode,
+              loss=total_loss,
+              train_op=train_op,
+              scaffold_fn=scaffold_fn)
+      else:
+          output_spec = tf.estimator.EstimatorSpec(
+              mode=mode,
+              loss=total_loss,
+              train_op=train_op,
+              scaffold=None
+          )
     elif mode == tf.estimator.ModeKeys.EVAL:
 
       def metric_fn(masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
@@ -224,11 +234,16 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
           masked_lm_weights, next_sentence_example_loss,
           next_sentence_log_probs, next_sentence_labels
       ])
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-          mode=mode,
-          loss=total_loss,
-          eval_metrics=eval_metrics,
-          scaffold_fn=scaffold_fn)
+      if FLAGS.use_tpu:
+          output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+              mode=mode,
+              loss=total_loss,
+              eval_metrics=eval_metrics,
+              scaffold_fn=scaffold_fn)
+      else:
+          output_spec = tf.estimator.EstimatorSpec(
+              mode=mode,
+              loss=total_loss)
     else:
       raise ValueError("Only TRAIN and EVAL modes are supported: %s" % (mode))
 
@@ -426,16 +441,31 @@ def main(_):
     tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
         FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
 
-  is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-  run_config = tf.contrib.tpu.RunConfig(
-      cluster=tpu_cluster_resolver,
-      master=FLAGS.master,
-      model_dir=FLAGS.output_dir,
-      save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-      tpu_config=tf.contrib.tpu.TPUConfig(
-          iterations_per_loop=FLAGS.iterations_per_loop,
-          num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
+    is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
+  if FLAGS.use_tpu:
+        run_config = tf.contrib.tpu.RunConfig(
+            cluster=tpu_cluster_resolver,
+            master=FLAGS.master,
+            model_dir=FLAGS.output_dir,
+            save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+            tpu_config=tf.contrib.tpu.TPUConfig(
+                iterations_per_loop=FLAGS.iterations_per_loop,
+                num_shards=FLAGS.num_tpu_cores,
+                per_host_input_for_training=is_per_host))
+  else:
+        if FLAGS.multi_worker:
+            distribution = tf.contrib.distribute.CollectiveAllReduceStrategy(num_gpus_per_worker=1)
+            run_config = tf.estimator.RunConfig(
+                experimental_distribute=tf.contrib.distribute.DistributeConfig(
+                    train_distribute=distribution,
+                    remote_cluster={
+                        'worker': ['localhost:5000', 'localhost:5001'],
+                    },
+                )
+            )
+        else:
+            distribution = tf.contrib.distribute.MirroredStrategy(num_gpus=FLAGS.num_gpus)
+            run_config = tf.estimator.RunConfig(train_distribute=distribution)
 
   model_fn = model_fn_builder(
       bert_config=bert_config,
@@ -444,16 +474,25 @@ def main(_):
       num_train_steps=FLAGS.num_train_steps,
       num_warmup_steps=FLAGS.num_warmup_steps,
       use_tpu=FLAGS.use_tpu,
-      use_one_hot_embeddings=FLAGS.use_tpu)
+      use_one_hot_embeddings=True)
 
   # If TPU is not available, this will fall back to normal Estimator on CPU
   # or GPU.
-  estimator = tf.contrib.tpu.TPUEstimator(
-      use_tpu=FLAGS.use_tpu,
-      model_fn=model_fn,
-      config=run_config,
-      train_batch_size=FLAGS.train_batch_size,
-      eval_batch_size=FLAGS.eval_batch_size)
+  if FLAGS.use_tpu:
+        estimator = tf.contrib.tpu.TPUEstimator(
+            use_tpu=FLAGS.use_tpu,
+            model_fn=model_fn,
+            config=run_config,
+            train_batch_size=FLAGS.train_batch_size,
+            eval_batch_size=FLAGS.eval_batch_size)
+  else:
+        estimator = tf.estimator.Estimator(
+            model_fn=model_fn,
+            config=run_config,
+            params={
+                'batch_size': FLAGS.train_batch_size if FLAGS.do_train else FLAGS.eval_batch_size,
+            }
+        )
 
   if FLAGS.do_train:
     tf.logging.info("***** Running training *****")

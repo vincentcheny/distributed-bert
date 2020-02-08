@@ -19,6 +19,7 @@ from __future__ import division
 from __future__ import print_function
 
 import os
+import json
 import modeling
 import optimization
 import tensorflow as tf
@@ -29,7 +30,7 @@ FLAGS = flags.FLAGS
 
 ## Required parameters
 flags.DEFINE_string(
-    "bert_config_file", None,
+    "bert_config_file", ./bert_config_file,
     "The config json file corresponding to the pre-trained BERT model. "
     "This specifies the model architecture.")
 
@@ -57,9 +58,9 @@ flags.DEFINE_integer(
     "Maximum number of masked LM predictions per sequence. "
     "Must match data generation.")
 
-flags.DEFINE_bool("do_train", False, "Whether to run training.")
+flags.DEFINE_bool("do_train", True, "Whether to run training.")
 
-flags.DEFINE_bool("do_eval", False, "Whether to run eval on the dev set.")
+flags.DEFINE_bool("do_eval", True, "Whether to run eval on the dev set.")
 
 flags.DEFINE_integer("train_batch_size", 32, "Total batch size for training.")
 
@@ -105,8 +106,27 @@ flags.DEFINE_integer(
     "num_tpu_cores", 8,
     "Only used if `use_tpu` is True. Total number of TPU cores to use.")
 
-flags.DEFINE_integer("num_gpus", 4, "Total number of GPUs to use.")
-flags.DEFINE_bool("multi_worker", False, "Multi-worker training.")
+flags.DEFINE_integer("num_gpus", 2, "Total number of GPUs to use.")
+flags.DEFINE_bool("multi_worker", True, "Multi-worker training.")
+
+# My additional flags
+tf.app.flags.DEFINE_boolean('use_original_ckpt', True, 'use original ckpt')
+tf.app.flags.DEFINE_integer('save_ckpt_steps', 200, 'save ckpt per n steps')
+flags.DEFINE_integer('task_index', 0, 'task_index')
+flags.DEFINE_string('worker', "localhost:3000,localhost:3001", 'specify workers in the cluster')
+
+worker = FLAGS.worker.split(',')
+task_index = FLAGS.task_index
+os.environ["CUDA_VISIBLE_DEVICES"]=str(task_index)
+if not FLAGS.use_original_ckpt:
+    tf.train.TFTunerContext.init_context(len(worker), task_index)
+
+os.environ['TF_CONFIG'] = json.dumps({
+    'cluster': {
+        'worker': worker
+    },
+    'task': {'type': 'worker', 'index': task_index}
+})
 
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps, use_tpu,
@@ -454,15 +474,18 @@ def main(_):
                 per_host_input_for_training=is_per_host))
   else:
         if FLAGS.multi_worker:
-            distribution = tf.contrib.distribute.CollectiveAllReduceStrategy(num_gpus_per_worker=1)
-            run_config = tf.estimator.RunConfig(
-                experimental_distribute=tf.contrib.distribute.DistributeConfig(
-                    train_distribute=distribution,
-                    remote_cluster={
-                        'worker': ['localhost:5000', 'localhost:5001'],
-                    },
-                )
-            )
+            # distribution = tf.contrib.distribute.CollectiveAllReduceStrategy(num_gpus_per_worker=1)
+            # run_config = tf.estimator.RunConfig(
+            #     experimental_distribute=tf.contrib.distribute.DistributeConfig(
+            #         train_distribute=distribution,
+            #         remote_cluster={
+            #             'worker': ['localhost:5000', 'localhost:5001'],
+            #         },
+            #     )
+            # )
+            strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy()
+            run_config = tf.estimator.RunConfig(save_summary_steps=1, train_distribute=strategy, model_dir=FLAGS.output_dir,
+                                save_checkpoints_steps=FLAGS.save_ckpt_steps, log_step_count_steps=1)
         else:
             distribution = tf.contrib.distribute.MirroredStrategy(num_gpus=FLAGS.num_gpus)
             run_config = tf.estimator.RunConfig(train_distribute=distribution)
@@ -493,36 +516,53 @@ def main(_):
                 'batch_size': FLAGS.train_batch_size if FLAGS.do_train else FLAGS.eval_batch_size,
             }
         )
-
-  if FLAGS.do_train:
+  if FLAGS.do_train and FLAGS.do_eval:
     tf.logging.info("***** Running training *****")
-    tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
+    tf.logging.info("  Training batch size = %d", FLAGS.train_batch_size)
     train_input_fn = input_fn_builder(
-        input_files=input_files,
-        max_seq_length=FLAGS.max_seq_length,
-        max_predictions_per_seq=FLAGS.max_predictions_per_seq,
-        is_training=True)
-    estimator.train(input_fn=train_input_fn, max_steps=FLAGS.num_train_steps)
-
-  if FLAGS.do_eval:
-    tf.logging.info("***** Running evaluation *****")
-    tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
-
+      input_files=input_files,
+      max_seq_length=FLAGS.max_seq_length,
+      max_predictions_per_seq=FLAGS.max_predictions_per_seq,
+      is_training=True)
     eval_input_fn = input_fn_builder(
-        input_files=input_files,
-        max_seq_length=FLAGS.max_seq_length,
-        max_predictions_per_seq=FLAGS.max_predictions_per_seq,
-        is_training=False)
+      input_files=input_files,
+      max_seq_length=FLAGS.max_seq_length,
+      max_predictions_per_seq=FLAGS.max_predictions_per_seq,
+      is_training=False)
+    tf.estimator.train_and_evaluate(
+        estimator,
+        train_spec=tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=100),
+        eval_spec=tf.estimator.EvalSpec(input_fn=eval_input_fn, steps=10)
+    )
+  # if FLAGS.do_train:
+  #   tf.logging.info("***** Running training *****")
+  #   tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
+  #   train_input_fn = input_fn_builder(
+  #       input_files=input_files,
+  #       max_seq_length=FLAGS.max_seq_length,
+  #       max_predictions_per_seq=FLAGS.max_predictions_per_seq,
+  #       is_training=True)
+  #   estimator.train(input_fn=train_input_fn, max_steps=FLAGS.num_train_steps)
 
-    result = estimator.evaluate(
-        input_fn=eval_input_fn, steps=FLAGS.max_eval_steps)
+  # if FLAGS.do_eval:
+  #   tf.logging.info("***** Running evaluation *****")
+  #   tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
 
-    output_eval_file = os.path.join(FLAGS.output_dir, "eval_results.txt")
-    with tf.gfile.GFile(output_eval_file, "w") as writer:
-      tf.logging.info("***** Eval results *****")
-      for key in sorted(result.keys()):
-        tf.logging.info("  %s = %s", key, str(result[key]))
-        writer.write("%s = %s\n" % (key, str(result[key])))
+  #   eval_input_fn = input_fn_builder(
+  #       input_files=input_files,
+  #       max_seq_length=FLAGS.max_seq_length,
+  #       max_predictions_per_seq=FLAGS.max_predictions_per_seq,
+  #       is_training=False)
+
+  #   result = estimator.evaluate(
+  #       input_fn=eval_input_fn, steps=FLAGS.max_eval_steps)
+
+  #   output_eval_file = os.path.join(FLAGS.output_dir, "eval_results.txt")
+  #   with tf.gfile.GFile(output_eval_file, "w") as writer:
+  #     tf.logging.info("***** Eval results *****")
+  #     for key in sorted(result.keys()):
+  #       tf.logging.info("  %s = %s", key, str(result[key]))
+  #       writer.write("%s = %s\n" % (key, str(result[key])))
 
 
 if __name__ == "__main__":
